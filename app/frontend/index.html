@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>보험계리식 OCR 페이지 조회 PoC</title>
+  <style>
+    :root { --blue:#0b3a75; --line:#d7e1ee; --bg:#f6f8fb; --card:#ffffff; --green:#0d7a3b; --orange:#d36b00; --red:#bb1e10; }
+    body { margin:0; font-family: Arial, 'Noto Sans KR', sans-serif; background:var(--bg); color:#1b2b3a; }
+    header { background:var(--blue); color:#fff; padding:18px 26px; }
+    header h1 { margin:0; font-size:22px; }
+    main { display:grid; grid-template-columns: 320px minmax(0, 1fr); gap:14px; padding:14px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; box-shadow:0 1px 4px rgba(0,0,0,.05); }
+    .panel h2 { margin:0 0 12px; font-size:17px; color:var(--blue); }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    input[type=file], input[type=text], textarea, select { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; box-sizing:border-box; }
+    textarea { min-height:86px; font-family: Consolas, monospace; resize:vertical; }
+    button { background:#0e5bb8; color:white; border:0; border-radius:8px; padding:10px 12px; cursor:pointer; }
+    button.secondary { background:#536271; }
+    button.good { background:var(--green); }
+    button.bad { background:var(--red); }
+    button:hover { opacity:.9; }
+    .doc-item, .page-item { border:1px solid var(--line); border-radius:8px; padding:10px; margin:8px 0; cursor:pointer; background:#fff; }
+    .doc-item:hover, .page-item:hover { border-color:#0e5bb8; }
+    .small { font-size:12px; color:#6b7785; }
+    .status { display:inline-block; padding:3px 7px; border-radius:999px; font-size:12px; background:#eaf2ff; color:#0b3a75; }
+    .status.APPROVED { background:#e6f5eb; color:var(--green); }
+    .status.REJECTED, .status.ERROR { background:#fdebea; color:var(--red); }
+    .status.NEEDS_REVIEW, .status.REVIEW { background:#fff4e6; color:var(--orange); }
+    .seg { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin:10px 0; }
+    .seg label { border:1px solid var(--line); border-radius:8px; padding:9px; cursor:pointer; background:#fff; font-size:13px; }
+    .seg label:has(input:checked) { border-color:#0e5bb8; background:#eaf2ff; color:#0b3a75; font-weight:bold; }
+    .seg input { margin-right:6px; }
+    .grid { display:grid; grid-template-columns: 180px minmax(0, 1fr); gap:14px; }
+    pre { white-space:pre-wrap; background:#f0f3f7; border:1px solid var(--line); border-radius:8px; padding:12px; overflow:auto; }
+    .formula { border:1px solid #bfd2ea; border-radius:10px; padding:12px; margin:12px 0; background:#fbfdff; }
+    .latex { font-family: 'Times New Roman', serif; font-size:18px; padding:10px; background:#fff; border:1px dashed #b6c6d9; border-radius:8px; overflow:auto; }
+    .page-viewer { overflow:auto; border:1px solid var(--line); border-radius:8px; background:#fff; max-height:78vh; }
+    .asset-img { width:var(--page-zoom, 150%); max-width:none; border:0; display:block; }
+    .viewer-toolbar { position:sticky; top:0; z-index:2; display:flex; gap:8px; align-items:center; justify-content:space-between; padding:8px; border-bottom:1px solid var(--line); background:#f8fbff; }
+    .viewer-toolbar button { padding:6px 9px; border-radius:6px; }
+    .viewer-toolbar .zoom-label { min-width:52px; text-align:center; font-size:12px; color:#536271; }
+    .two { display:grid; grid-template-columns: minmax(620px, 1.35fr) minmax(420px, .9fr); gap:14px; align-items:start; }
+    @media (max-width: 1000px) { main { grid-template-columns:1fr; } .grid,.two { grid-template-columns:1fr; } }
+  </style>
+  <script>
+    window.MathJax = { tex: { inlineMath: [['$', '$'], ['\\(', '\\)']] }, svg: { fontCache: 'global' } };
+  </script>
+  <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+</head>
+<body>
+<header>
+  <h1>보험계리식 OCR · DB 저장 · 페이지별 조회 PoC</h1>
+  <div class="small" style="color:#dbe9ff">PPTX/PDF/Image 업로드 → 페이지 저장 → 계리식 후보 저장 → 페이지별 공식 조회</div>
+</header>
+<main>
+  <section class="panel">
+    <h2>1. 문서 업로드</h2>
+    <input id="file" type="file" accept=".pptx,.pdf,.png,.jpg,.jpeg,.webp" />
+    <div class="small" style="margin-top:10px">수식 OCR 엔진 선택</div>
+    <div class="seg">
+      <label><input type="radio" name="ocrEngine" value="formula" checked />formula-ocr</label>
+      <label><input type="radio" name="ocrEngine" value="qwen" />Qwen2-VL</label>
+      <label><input type="radio" name="ocrEngine" value="azure-ai" />Azure AI</label>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button onclick="upload()">업로드 및 인식</button>
+      <button class="secondary" onclick="loadDocs()">문서 목록 새로고침</button>
+    </div>
+    <pre id="uploadResult">업로드 결과가 여기에 표시됩니다.</pre>
+
+    <h2>관리</h2>
+    <div class="row">
+      <button class="bad" onclick="deleteOcrData()">OCR 파일/DB 데이터 삭제</button>
+      <button class="secondary" onclick="loadDbSummary()">DB 현황</button>
+    </div>
+    <pre id="adminResult">관리 작업 결과가 여기에 표시됩니다.</pre>
+
+    <h2>2. 문서 목록</h2>
+    <div id="docs"></div>
+
+    <h2>3. 계리식 검색</h2>
+    <input id="search" type="text" placeholder="예: 순보험료, 예상 사망자 수, frac, q_x" onkeydown="if(event.key==='Enter') searchFormulas()" />
+    <div class="row" style="margin-top:10px"><button onclick="searchFormulas()">검색</button></div>
+    <div id="searchResults"></div>
+
+    <h2>4. DB 조회</h2>
+    <select id="dbTables" onchange="loadDbTable()"></select>
+    <div class="row" style="margin-top:8px">
+      <button onclick="loadDbSummary()">테이블 목록</button>
+      <button class="secondary" onclick="loadDbTable()">선택 테이블 조회</button>
+    </div>
+    <textarea id="sql" placeholder="SELECT * FROM documents LIMIT 20">SELECT id, filename, file_type, page_count, status, created_at FROM documents ORDER BY created_at DESC LIMIT 20</textarea>
+    <div class="row" style="margin-top:8px"><button onclick="runSql()">SQL 조회</button></div>
+    <pre id="dbResult">SELECT/WITH/PRAGMA table_info 조회만 가능합니다.</pre>
+  </section>
+
+  <section class="panel">
+    <h2>문서 / 페이지 상세</h2>
+    <div id="docSummary" class="small">문서를 선택하세요.</div>
+    <div class="grid" style="margin-top:12px">
+      <div>
+        <h2>페이지</h2>
+        <div id="pages"></div>
+      </div>
+      <div>
+        <h2>페이지 내용</h2>
+        <div id="pageDetail">페이지를 선택하세요.</div>
+      </div>
+    </div>
+  </section>
+</main>
+<script>
+const API = '/api';
+let currentDocumentId = null;
+let pageZoom = 1.5;
+
+async function api(path, options={}) {
+  const res = await fetch(API + path, options);
+  if (!res.ok) throw new Error(await res.text());
+  return await res.json();
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function statusBadge(s) { return `<span class="status ${esc(s)}">${esc(s)}</span>`; }
+function rerenderMath() { if (window.MathJax && window.MathJax.typesetPromise) MathJax.typesetPromise(); }
+
+async function upload() {
+  const f = document.getElementById('file').files[0];
+  if (!f) { alert('파일을 선택하세요.'); return; }
+	  const fd = new FormData();
+	  fd.append('file', f);
+	  fd.append('ocr_engine', document.querySelector('input[name="ocrEngine"]:checked')?.value || 'formula');
+  document.getElementById('uploadResult').textContent = '처리 중...';
+  try {
+    const data = await api('/documents/upload', { method:'POST', body:fd });
+    document.getElementById('uploadResult').textContent = JSON.stringify(data, null, 2);
+    await loadDocs();
+    await selectDoc(data.document_id);
+  } catch(e) {
+    document.getElementById('uploadResult').textContent = e.message;
+  }
+}
+
+async function loadDocs() {
+  const docs = await api('/documents');
+  document.getElementById('docs').innerHTML = docs.map(d => `
+    <div class="doc-item" onclick="selectDoc('${d.id}')">
+      <b>${esc(d.filename)}</b><br/>
+      <span class="small">${esc(d.file_type)} · ${d.page_count} pages · ${esc(d.created_at)}</span><br/>
+      ${statusBadge(d.status)}
+    </div>`).join('') || '<div class="small">문서 없음</div>';
+}
+
+async function selectDoc(id) {
+  currentDocumentId = id;
+  const data = await api(`/documents/${id}`);
+  const d = data.document;
+	  document.getElementById('docSummary').innerHTML = `<b>${esc(d.filename)}</b> · ${d.page_count} pages · ${statusBadge(d.status)} <button class="secondary" onclick="regroupFormulas('${id}')">수식 다시 묶기</button> <button class="secondary" onclick="revalidateDocument('${id}')">전체 재검증</button>`;
+  document.getElementById('pages').innerHTML = data.pages.map(p => `
+    <div class="page-item" onclick="selectPage('${id}', ${p.page_no})">
+      <b>Page ${p.page_no}</b><br/>
+      <span class="small">${esc(p.title || '')}</span><br/>
+      <span class="small">${esc(p.preview || '').slice(0,80)}</span>
+    </div>`).join('');
+  if (data.pages.length) await selectPage(id, data.pages[0].page_no);
+}
+
+async function selectPage(id, pageNo) {
+  const data = await api(`/documents/${id}/pages/${pageNo}`);
+  const p = data.page;
+  const img = p.image_path ? `
+    <div class="page-viewer" style="--page-zoom:${Math.round(pageZoom * 100)}%">
+      <div class="viewer-toolbar">
+        <span class="small">PDF 원본 보기</span>
+        <span class="row">
+          <button class="secondary" onclick="setPageZoom(${pageNo}, -0.1)">-</button>
+          <span class="zoom-label">${Math.round(pageZoom * 100)}%</span>
+          <button class="secondary" onclick="setPageZoom(${pageNo}, 0.1)">+</button>
+          <button class="secondary" onclick="resetPageZoom(${pageNo})">150%</button>
+        </span>
+      </div>
+      <img class="asset-img" src="${API}/assets?path=${encodeURIComponent(p.image_path)}" />
+    </div>` : '';
+  const formulas = data.formulas.map(f => formulaCard(f)).join('') || '<div class="small">이 페이지에서 인식된 계리식 후보가 없습니다.</div>';
+  const assets = data.assets.map(a => `<li>${esc(a.asset_type)} ${a.asset_path ? `<a href="${API}/assets?path=${encodeURIComponent(a.asset_path)}" target="_blank">열기</a>` : ''}</li>`).join('');
+  document.getElementById('pageDetail').innerHTML = `
+    <div class="two">
+      <div>
+        <h3>Page ${p.page_no}: ${esc(p.title || '')}</h3>
+        ${img}
+        <h3>추출 텍스트</h3>
+        <pre>${esc(p.extracted_text || '')}</pre>
+      </div>
+      <div>
+        <h3>인식된 계리식</h3>
+        ${formulas}
+        <h3>Assets</h3>
+        <ul>${assets}</ul>
+      </div>
+    </div>`;
+  rerenderMath();
+}
+
+function setPageZoom(pageNo, delta) {
+  pageZoom = Math.min(3.0, Math.max(0.8, Math.round((pageZoom + delta) * 10) / 10));
+  if (currentDocumentId) selectPage(currentDocumentId, pageNo);
+}
+
+function resetPageZoom(pageNo) {
+  pageZoom = 1.5;
+  if (currentDocumentId) selectPage(currentDocumentId, pageNo);
+}
+
+function formulaCard(f) {
+  const latex = esc(f.latex || '');
+  return `<div class="formula">
+    <div class="row">
+      <b>#${f.formula_seq} ${esc(f.formula_title || '계리식 후보')}</b>
+      ${statusBadge(f.status)}
+      <span class="small">confidence ${esc(f.confidence)}</span>
+    </div>
+	    <div class="latex">$$${latex}$$</div>
+	    <div class="small">source: ${esc(f.source_type)} · ${esc(f.validation_message || '')}</div>
+	    <details><summary>실제 OCR 원문 / 후처리 비교</summary><pre>RAW:
+${esc(f.raw_text || '')}
+
+POST:
+${esc(f.latex || '')}</pre></details>
+	    <details><summary>DSL / 변수 보기</summary><pre>${esc(JSON.stringify(f.formula_dsl || f.formula_dsl_json || {}, null, 2))}</pre></details>
+	    <div class="row" style="margin-top:8px">
+	      <button class="secondary" onclick="revalidateFormula(${f.id})">후처리 재검증</button>
+	      <button class="good" onclick="approve(${f.id})">승인</button>
+	      <button class="bad" onclick="rejectFormula(${f.id})">반려</button>
+	    </div>
+  </div>`;
+}
+
+async function approve(id) {
+  await api(`/formulas/${id}/approve`, {method:'POST'});
+  if (currentDocumentId) selectDoc(currentDocumentId);
+}
+async function rejectFormula(id) {
+  await api(`/formulas/${id}/reject`, {method:'POST'});
+  if (currentDocumentId) selectDoc(currentDocumentId);
+}
+
+async function revalidateFormula(id) {
+  try {
+    const data = await api(`/formulas/${id}/revalidate`, {method:'POST'});
+    alert(`재검증 완료\n상태: ${data.status}\n${data.validation_message}`);
+    if (currentDocumentId) selectDoc(currentDocumentId);
+  } catch(e) {
+    alert(e.message);
+  }
+}
+
+async function revalidateDocument(id) {
+  if (!confirm('현재 문서의 모든 수식 후보에 대해 실제 OCR 원문 기반 후처리/검증을 다시 수행할까요?')) return;
+  try {
+    const data = await api(`/documents/${id}/revalidate-formulas`, {method:'POST'});
+    alert(`재검증 수식 수: ${data.revalidated_formulas}`);
+    await selectDoc(id);
+  } catch(e) {
+    alert(e.message);
+  }
+}
+
+async function regroupFormulas(id) {
+  if (!confirm('기존 공식 후보를 삭제하고 페이지 OCR 텍스트에서 수식을 다시 묶습니다. 계속할까요?')) return;
+  const data = await api(`/documents/${id}/regroup-formulas`, {method:'POST'});
+  alert(`다시 묶은 공식 수: ${data.regrouped_formulas}`);
+  await selectDoc(id);
+}
+
+async function searchFormulas() {
+  const q = document.getElementById('search').value;
+  const rows = await api(`/formulas/search?q=${encodeURIComponent(q)}`);
+  document.getElementById('searchResults').innerHTML = rows.map(r => `
+    <div class="formula">
+      <b>${esc(r.filename)}</b> · Page ${r.page_no} · ${statusBadge(r.status)}
+      <div class="latex">$$${esc(r.latex || '')}$$</div>
+      <button onclick="selectDoc('${r.document_id}')">문서 열기</button>
+    </div>`).join('') || '<div class="small">검색 결과 없음</div>';
+  rerenderMath();
+}
+
+async function deleteOcrData() {
+  if (!confirm('기존 OCR 수행 파일, 페이지, 수식 후보, DB 저장 내역을 삭제합니다. 계속할까요?')) return;
+  if (!confirm('되돌릴 수 없습니다. 정말 삭제할까요?')) return;
+  try {
+    const data = await api('/admin/ocr-data/delete', {method:'POST'});
+    document.getElementById('adminResult').textContent = JSON.stringify(data, null, 2);
+    document.getElementById('docs').innerHTML = '';
+    document.getElementById('pages').innerHTML = '';
+    document.getElementById('pageDetail').textContent = '페이지를 선택하세요.';
+    document.getElementById('docSummary').textContent = '문서를 선택하세요.';
+    currentDocumentId = null;
+    await loadDocs();
+    await loadDbSummary();
+  } catch(e) {
+    document.getElementById('adminResult').textContent = e.message;
+  }
+}
+
+async function loadDbSummary() {
+  try {
+    const rows = await api('/admin/db/summary');
+    const select = document.getElementById('dbTables');
+    select.innerHTML = rows.map(r => `<option value="${esc(r.table)}">${esc(r.table)} (${r.rows})</option>`).join('');
+    document.getElementById('dbResult').textContent = JSON.stringify(rows, null, 2);
+  } catch(e) {
+    document.getElementById('dbResult').textContent = e.message;
+  }
+}
+
+async function loadDbTable() {
+  const table = document.getElementById('dbTables').value;
+  if (!table) return loadDbSummary();
+  try {
+    const rows = await api(`/admin/db/tables/${encodeURIComponent(table)}?limit=100`);
+    document.getElementById('dbResult').textContent = JSON.stringify(rows, null, 2);
+  } catch(e) {
+    document.getElementById('dbResult').textContent = e.message;
+  }
+}
+
+async function runSql() {
+  const sql = document.getElementById('sql').value;
+  try {
+    const rows = await api('/admin/db/query', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sql})
+    });
+    document.getElementById('dbResult').textContent = JSON.stringify(rows, null, 2);
+  } catch(e) {
+    document.getElementById('dbResult').textContent = e.message;
+  }
+}
+
+loadDocs().catch(e => console.error(e));
+loadDbSummary().catch(e => console.error(e));
+</script>
+</body>
+</html>

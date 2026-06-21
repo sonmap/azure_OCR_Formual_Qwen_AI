@@ -1,0 +1,19 @@
+subscription_id = "00000000-0000-0000-0000-000000000000"
+location        = "koreacentral"
+name_prefix     = "actocr"
+
+# 보안을 위해 실제 접속 IP/32로 줄이세요.
+allowed_ssh_cidr = "0.0.0.0/0"
+allowed_app_cidr = "0.0.0.0/0"
+
+# Qwen2-VL CPU 테스트용. 비용 절감이 우선이면 Standard_D4s_v5로 낮출 수 있지만 OOM 가능성이 커집니다.
+vm_size         = "Standard_D8s_v5"
+os_disk_size_gb = 128
+
+# 로컬 앱 디렉터리. 비워두면 인프라만 생성합니다.
+source_app_path = "../actuarial-formula-page-ocr-local-regroup"
+deploy_app      = true
+
+# true면 Qwen도 같이 기동합니다. 메모리/시간 이슈가 있으면 false로 두고 수동 기동하세요.
+start_qwen = false
+

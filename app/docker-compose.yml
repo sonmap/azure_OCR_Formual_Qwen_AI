@@ -1,0 +1,52 @@
+services:
+
+  qwen-vl:
+    build: ./qwen-vl
+    container_name: actuarial-qwen-vl
+    environment:
+      HF_HOME: /models/huggingface
+      TRANSFORMERS_CACHE: /models/huggingface
+      QWEN_MODEL_ID: Qwen/Qwen2-VL-2B-Instruct
+      QWEN_MAX_NEW_TOKENS: 128
+      TORCH_NUM_THREADS: 2
+    volumes:
+      - ./qwen-vl-models:/models
+    ports:
+      -  9100:9100
+    profiles:
+      - qwen
+
+  formula-ocr:
+    build: ./formula-ocr
+    container_name: actuarial-formula-ocr
+    environment:
+      HF_HOME: /models/huggingface
+      TORCH_HOME: /models/torch
+    volumes:
+      - ./formula-ocr-models:/models
+    ports:
+      - "9000:9000"
+
+  backend:
+    build: ./backend
+    container_name: actuarial-formula-backend
+    depends_on:
+      - formula-ocr
+    environment:
+      DATA_DIR: /data
+      DB_PATH: /data/app.db
+      TESSERACT_LANG: kor+eng
+      FORMULA_OCR_URL: http://qwen-vl:9100/predict
+      FORMULA_OCR_TIMEOUT: 480
+    volumes:
+      - ./data:/data
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    container_name: actuarial-formula-frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"

@@ -1,0 +1,34 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - git
+  - jq
+
+write_files:
+  - path: /etc/actuarial-ocr-azure.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      AZURE_AI_ENDPOINT=${azure_ai_endpoint}
+      AZURE_AI_KEY=${azure_ai_key}
+      FORMULA_OCR_URL_FORMULA=http://formula-ocr:9000/predict
+      FORMULA_OCR_URL_QWEN=http://qwen-vl:9100/predict
+      FORMULA_OCR_URL_AZURE=http://azure-ai-ocr:9200/predict
+
+runcmd:
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  - chmod a+r /etc/apt/keyrings/docker.gpg
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  - usermod -aG docker ${admin_username}
+  - mkdir -p ${app_dir}
+  - chown -R ${admin_username}:${admin_username} ${app_dir}
+  - systemctl enable docker
+  - systemctl start docker

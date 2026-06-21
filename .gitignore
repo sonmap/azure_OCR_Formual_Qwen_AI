@@ -1,0 +1,41 @@
+# App runtime data and downloaded models
+app/data/
+app/formula-ocr-models/
+app/qwen-vl-models/
+app/**/*.bak
+app/**/*.bak-*
+
+# Terraform local files
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/tfplan
+terraform/crash.log
+terraform/crash.*.log
+terraform/override.tf
+terraform/override.tf.json
+terraform/*_override.tf
+terraform/*_override.tf.json
+
+# Local variables and secrets
+terraform/terraform.tfvars
+terraform/terraform.tfvars.json
+terraform/*.auto.tfvars
+terraform/*.auto.tfvars.json
+.env
+.env.*
+**/.env
+**/.env.*
+
+# SSH keys and generated credentials
+terraform/generated-ssh.pem
+*.pem
+id_rsa
+id_rsa.pub
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

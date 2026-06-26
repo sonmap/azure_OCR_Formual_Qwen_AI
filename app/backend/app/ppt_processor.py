@@ -10,6 +10,7 @@ from PIL import Image
 from pptx import Presentation
 
 from .db import get_conn, utc_now
+from .formula_layout import recognize_formula_regions
 from .formula_ocr import recognize_formula_image
 from .formula_parser import (
     build_formula_dsl,
@@ -19,6 +20,7 @@ from .formula_parser import (
     try_evaluate_simple_numbers,
     validate_formula_candidate,
 )
+from .formula_structure import formula_diagnostics, repair_formula_latex
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -36,7 +38,7 @@ def save_upload(fileobj, filename: str) -> tuple[str, str]:
     safe_name = filename.replace("/", "_").replace("\\", "_")
     dest = UPLOAD_DIR / f"{doc_id}_{safe_name}"
     with open(dest, "wb") as f:
-        shutil.copyfileobj(fileobj, f)
+        shutil.copyfileobj(fileobj)
     return doc_id, str(dest)
 
 
@@ -82,15 +84,21 @@ def _insert_asset(conn, doc_id: str, page_no: int, asset_type: str, asset_path: 
 
 def _insert_formula(conn, doc_id: str, page_no: int, item: dict[str, Any], source_type_override: str | None = None) -> int:
     latex = item.get("latex") or item.get("raw_text") or ""
+    latex = repair_formula_latex(latex)
     latex = normalize_broken_formula_text(latex)
     item["latex"] = latex
     dsl = build_formula_dsl(latex)
+    diagnostics = formula_diagnostics(latex)
+    if diagnostics:
+        dsl["structure_diagnostics"] = diagnostics
     variables = dsl.get("variables", [])
     status, msg = validate_formula_candidate(latex)
+    if diagnostics.get("warnings"):
+        msg = f"{msg}; structure_warnings={','.join(diagnostics['warnings'])}"
     numeric_hint = try_evaluate_simple_numbers(latex)
     if numeric_hint:
         dsl["numeric_hint"] = numeric_hint
-    final_status = item.get("status") or ("CANDIDATE" if status == "PASS" else "NEEDS_REVIEW")
+    final_status = item.get("status") or ("CANDIDATE" if status == "PASS" and not diagnostics.get("warnings") else "NEEDS_REVIEW")
     cur = conn.execute(
         """
         INSERT INTO formula_blocks(
@@ -123,7 +131,42 @@ def _insert_formula(conn, doc_id: str, page_no: int, item: dict[str, Any], sourc
         "INSERT INTO formula_validation_results(formula_id,rule_name,result,message,created_at) VALUES(?,?,?,?,?)",
         (formula_id, "basic_syntax", status, msg, utc_now()),
     )
+    conn.execute(
+        "INSERT INTO formula_validation_results(formula_id,rule_name,result,message,created_at) VALUES(?,?,?,?,?)",
+        (formula_id, "structure_diagnostics", "PASS" if not diagnostics.get("warnings") else "WARN", to_json(diagnostics), utc_now()),
+    )
     return formula_id
+
+
+def _insert_structured_image_formulas(conn, doc_id: str, page_no: int, image_path: str, ocr_engine: str | None, start_seq: int, title: str) -> int:
+    """Run formula-region OCR and insert all structured candidates."""
+    inserted = 0
+    try:
+        candidates = recognize_formula_regions(image_path, ocr_engine)
+    except Exception:
+        candidates = []
+
+    if not candidates:
+        rec = recognize_formula_image(image_path, ocr_engine)
+        if rec.get("latex") or rec.get("raw_text"):
+            candidates = [
+                {
+                    "formula_seq": start_seq,
+                    "formula_title": title,
+                    "raw_text": rec.get("raw_text"),
+                    "latex": rec.get("latex"),
+                    "confidence": rec.get("confidence", 0.0),
+                    "source_type": f"image_formula_{rec.get('engine')}",
+                    "status": rec.get("status", "NEEDS_REVIEW"),
+                }
+            ]
+
+    for offset, cand in enumerate(candidates):
+        cand["formula_seq"] = start_seq + offset
+        cand.setdefault("formula_title", title)
+        _insert_formula(conn, doc_id, page_no, cand)
+        inserted += 1
+    return inserted
 
 
 def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) -> int:
@@ -156,26 +199,19 @@ def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) ->
                         img_path = slide_asset_dir / f"image_{shape_no}.{ext}"
                         with open(img_path, "wb") as f:
                             f.write(shape.image.blob)
-                        rec = recognize_formula_image(str(img_path), ocr_engine)
-                        _insert_asset(conn, doc_id, idx, "image", str(img_path), rec.get("raw_text"), {"shape_no": shape_no, "engine": rec.get("engine")})
-                        if rec.get("latex"):
-                            _insert_formula(
-                                conn,
-                                doc_id,
-                                idx,
-                                {
-                                    "formula_seq": formula_seq,
-                                    "formula_title": "이미지 수식 OCR 후보",
-                                    "raw_text": rec.get("raw_text"),
-                                    "latex": rec.get("latex"),
-                                    "confidence": rec.get("confidence", 0.0),
-                                    "source_type": f"image_formula_{rec.get('engine')}",
-                                    "status": rec.get("status", "NEEDS_REVIEW"),
-                                },
-                            )
-                            formula_seq += 1
-                    except Exception:
-                        pass
+                        inserted = _insert_structured_image_formulas(
+                            conn,
+                            doc_id,
+                            idx,
+                            str(img_path),
+                            ocr_engine,
+                            formula_seq,
+                            "PPT 이미지 수식 구조 OCR 후보",
+                        )
+                        _insert_asset(conn, doc_id, idx, "image", str(img_path), f"structured_formula_candidates={inserted}", {"shape_no": shape_no, "engine": ocr_engine})
+                        formula_seq += inserted
+                    except Exception as exc:
+                        _insert_asset(conn, doc_id, idx, "image_error", None, str(exc), {"shape_no": shape_no})
 
             all_text = "\n".join(texts)
             _insert_page(conn, doc_id, idx, title, all_text)
@@ -192,24 +228,18 @@ def _process_image(doc_id: str, file_path: str, ocr_engine: str | None = None) -
     asset_dir.mkdir(parents=True, exist_ok=True)
     asset_path = asset_dir / Path(file_path).name
     shutil.copyfile(file_path, asset_path)
-    rec = recognize_formula_image(str(asset_path), ocr_engine)
     with get_conn() as conn:
-        _insert_page(conn, doc_id, page_no, "이미지 수식 페이지", rec.get("raw_text"), str(asset_path))
-        _insert_asset(conn, doc_id, page_no, "image", str(asset_path), rec.get("raw_text"), {"engine": rec.get("engine")})
-        _insert_formula(
+        _insert_page(conn, doc_id, page_no, "이미지 수식 페이지", "", str(asset_path))
+        inserted = _insert_structured_image_formulas(
             conn,
             doc_id,
             page_no,
-            {
-                "formula_seq": 1,
-                "formula_title": "이미지 수식 OCR 후보",
-                "raw_text": rec.get("raw_text"),
-                "latex": rec.get("latex"),
-                "confidence": rec.get("confidence", 0.0),
-                "source_type": f"image_formula_{rec.get('engine')}",
-                "status": rec.get("status", "NEEDS_REVIEW"),
-            },
+            str(asset_path),
+            ocr_engine,
+            1,
+            "이미지 수식 구조 OCR 후보",
         )
+        _insert_asset(conn, doc_id, page_no, "image", str(asset_path), f"structured_formula_candidates={inserted}", {"engine": ocr_engine})
     return 1
 
 
@@ -218,7 +248,7 @@ def _process_pdf(doc_id: str, file_path: str, ocr_engine: str | None = None) -> 
     with get_conn() as conn:
         for page_idx, page in enumerate(pdf, start=1):
             text = page.get_text("text") or ""
-            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
             page_dir = ASSET_DIR / doc_id / f"page_{page_idx}"
             page_dir.mkdir(parents=True, exist_ok=True)
             img_path = page_dir / "page.png"
@@ -229,23 +259,18 @@ def _process_pdf(doc_id: str, file_path: str, ocr_engine: str | None = None) -> 
                 c["formula_seq"] = formula_seq
                 _insert_formula(conn, doc_id, page_idx, c)
                 formula_seq += 1
-            # 텍스트에서 수식이 안 잡히면 페이지 이미지 OCR 후보 저장
-            if formula_seq == 1:
-                rec = recognize_formula_image(str(img_path), ocr_engine)
-                _insert_asset(conn, doc_id, page_idx, "page_image", str(img_path), rec.get("raw_text"), {"engine": rec.get("engine")})
-                if rec.get("latex"):
-                    _insert_formula(
-                        conn,
-                        doc_id,
-                        page_idx,
-                        {
-                            "formula_seq": formula_seq,
-                            "formula_title": "PDF 페이지 이미지 수식 OCR 후보",
-                            "raw_text": rec.get("raw_text"),
-                            "latex": rec.get("latex"),
-                            "confidence": rec.get("confidence", 0.0),
-                            "source_type": f"pdf_page_formula_{rec.get('engine')}",
-                            "status": rec.get("status", "NEEDS_REVIEW"),
-                        },
-                    )
+
+            # Always run structured region OCR for rendered PDF pages.
+            # Text extraction alone cannot recover 2D formulas such as fractions,
+            # summation bounds, integral bounds, and multi-line actuarial formulas.
+            inserted = _insert_structured_image_formulas(
+                conn,
+                doc_id,
+                page_idx,
+                str(img_path),
+                ocr_engine,
+                formula_seq,
+                "PDF 페이지 수식 영역 구조 OCR 후보",
+            )
+            _insert_asset(conn, doc_id, page_idx, "page_image", str(img_path), f"structured_formula_candidates={inserted}", {"engine": ocr_engine})
     return len(pdf)

@@ -9,13 +9,14 @@ from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 
 
-def recognize_formula_image(image_path: str, engine: str | None = None) -> dict[str, Any]:
-    """수식 이미지 인식 어댑터.
+def recognize_formula_image(image_path: str, engine: str | None = None, prompt: str | None = None) -> dict[str, Any]:
+    """Formula image recognition adapter.
 
-    우선순위:
-    1. FORMULA_OCR_URL 외부/로컬 모델 API 호출
-    2. pix2tex가 설치되어 있으면 사용
-    3. pytesseract fallback: LaTeX가 아니라 OCR 텍스트 후보만 반환
+    The important difference from general OCR is that formula OCR must preserve
+    two-dimensional structure: fractions, superscripts, subscripts, summation
+    bounds, integral bounds, and root spans. The optional prompt is passed to
+    vision LLM engines such as Qwen so that they return LaTeX instead of plain
+    text lines.
     """
     selected_engine = (engine or os.environ.get("FORMULA_OCR_ENGINE") or "").strip().lower()
     if selected_engine in {"azure", "azure-ai", "azure-vision"}:
@@ -28,18 +29,27 @@ def recognize_formula_image(image_path: str, engine: str | None = None) -> dict[
     if url:
         try:
             with open(image_path, "rb") as f:
-                r = requests.post(url, files={"file": f}, timeout=float(os.environ.get("FORMULA_OCR_TIMEOUT", "480")))
+                files = {"file": f}
+                data = {}
+                if prompt and selected_engine in {"qwen", "qwen-vl", "qwen2-vl"}:
+                    data["prompt"] = prompt
+                r = requests.post(
+                    url,
+                    files=files,
+                    data=data,
+                    timeout=float(os.environ.get("FORMULA_OCR_TIMEOUT", "480")),
+                )
             r.raise_for_status()
-            data = r.json()
-            latex = (data.get("latex") or data.get("text") or "").strip()
-            raw_text = (data.get("raw_text") or data.get("text") or latex).strip()
+            payload = r.json()
+            latex = (payload.get("latex") or payload.get("text") or "").strip()
+            raw_text = (payload.get("raw_text") or payload.get("text") or latex).strip()
             if not latex and not raw_text:
                 raise RuntimeError("external formula OCR returned an empty result")
             return {
                 "latex": latex,
                 "raw_text": raw_text,
-                "confidence": float(data.get("confidence", 0.90)),
-                "engine": data.get("engine") or "external_formula_ocr",
+                "confidence": float(payload.get("confidence", 0.90)),
+                "engine": payload.get("engine") or "external_formula_ocr",
                 "status": "CANDIDATE",
             }
         except Exception:

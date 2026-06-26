@@ -25,9 +25,24 @@ except Exception:  # pragma: no cover
     process_vision_info = None
 
 MODEL_ID = os.environ.get("QWEN_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
-MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "256"))
+MAX_NEW_TOKENS = int(os.environ.get("QWEN_MAX_NEW_TOKENS", "512"))
 
-app = FastAPI(title="Qwen VL OCR API", version="0.1.0")
+DEFAULT_FORMULA_PROMPT = """
+You are a mathematical OCR engine for actuarial formulas.
+Return ONLY LaTeX. Do not explain. Do not output Markdown.
+Preserve all two-dimensional math structure:
+- fractions as \\frac{numerator}{denominator}
+- summation as \\sum_{lower}^{upper}
+- integral as \\int_{lower}^{upper}
+- superscripts with ^{...}
+- subscripts with _{...}
+- roots as \\sqrt{...}
+- actuarial symbols such as l_x, q_x, p_x, v^t, D_x, N_x, A_x, \\ddot{a}_x
+- shifted ages such as l_{x+1}, q_{x+t}, E_{ANC}(t,x)
+If the image has multiple broken OCR lines, merge them into one valid LaTeX formula.
+""".strip()
+
+app = FastAPI(title="Qwen VL OCR API", version="0.2.0")
 
 _lock = threading.Lock()
 _model: Any | None = None
@@ -50,11 +65,7 @@ def health() -> dict[str, Any]:
 @app.post("/predict")
 async def predict(
     file: UploadFile = File(...),
-    prompt: str = Form(
-        "Read the actuarial formula in this image. Return only LaTeX. "
-        "Preserve actuarial symbols such as \\ddot{a}_x, l_x, N_x, D_x, "
-        "\\sum, e^{-\\alpha j}, and select-period notation."
-    ),
+    prompt: str = Form(DEFAULT_FORMULA_PROMPT),
 ) -> dict[str, Any]:
     model, processor = _load_model()
     suffix = Path(file.filename or "image.png").suffix or ".png"
@@ -92,12 +103,13 @@ async def predict(
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         output = processor.batch_decode(trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0].strip()
+        output = _strip_markdown(output)
         return {
             "latex": output,
             "text": output,
             "raw_text": output,
-            "confidence": 0.70 if output else 0.0,
-            "engine": "qwen-vl",
+            "confidence": 0.72 if output else 0.0,
+            "engine": "qwen-vl-structured-latex",
             "model_id": MODEL_ID,
         }
     finally:
@@ -105,6 +117,17 @@ async def predict(
             os.remove(image_path)
         except OSError:
             pass
+
+
+def _strip_markdown(text: str) -> str:
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = s.split("\n", 1)[1] if "\n" in s else s
+    if s.endswith("```"):
+        s = s[:-3]
+    if s.startswith("$$") and s.endswith("$$"):
+        s = s[2:-2]
+    return s.strip()
 
 
 def _load_model() -> tuple[Any, Any]:

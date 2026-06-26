@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
-from PIL import Image
 from pptx import Presentation
 
 from .db import get_conn, utc_now
@@ -38,7 +37,7 @@ def save_upload(fileobj, filename: str) -> tuple[str, str]:
     safe_name = filename.replace("/", "_").replace("\\", "_")
     dest = UPLOAD_DIR / f"{doc_id}_{safe_name}"
     with open(dest, "wb") as f:
-        shutil.copyfileobj(fileobj)
+        shutil.copyfileobj(fileobj, f)
     return doc_id, str(dest)
 
 

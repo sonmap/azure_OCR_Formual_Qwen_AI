@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse
 from .db import fetch_all, fetch_one, get_conn, init_db, utc_now
 from .ppt_processor import save_upload, process_document, _insert_formula
 
-app = FastAPI(title="Actuarial Formula Page OCR Local PoC", version="0.2.0")
+app = FastAPI(title="Actuarial Formula Page OCR Local PoC", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"status": "OK", "service": "actuarial-formula-page-ocr-local"}
+    return {"status": "OK", "service": "actuarial-formula-page-ocr-local", "version": "0.3.0"}
 
 
 @app.post("/documents/upload")
@@ -95,6 +95,7 @@ def delete_ocr_data():
     upload_dir = data_root / "uploads"
     asset_dir = data_root / "assets"
     with get_conn() as conn:
+        conn.execute("DELETE FROM page_content_blocks")
         conn.execute("DELETE FROM formula_validation_results")
         conn.execute("DELETE FROM formula_blocks")
         conn.execute("DELETE FROM page_assets")
@@ -104,7 +105,19 @@ def delete_ocr_data():
         if target.exists() and str(target).startswith(str(data_root)):
             shutil.rmtree(target)
         target.mkdir(parents=True, exist_ok=True)
-    return {"status": "DELETED", "deleted": ["documents", "pages", "page_assets", "formula_blocks", "formula_validation_results", "uploads", "assets"]}
+    return {
+        "status": "DELETED",
+        "deleted": [
+            "documents",
+            "pages",
+            "page_assets",
+            "page_content_blocks",
+            "formula_blocks",
+            "formula_validation_results",
+            "uploads",
+            "assets",
+        ],
+    }
 
 
 def _is_readonly_sql(sql: str) -> bool:
@@ -129,7 +142,17 @@ def get_document(document_id: str):
         "SELECT id,page_no,formula_seq,formula_title,latex,confidence,source_type,status,validation_message FROM formula_blocks WHERE document_id=? ORDER BY page_no, formula_seq",
         (document_id,),
     )
-    return {"document": doc, "pages": pages, "formulas": formulas}
+    content_summary = fetch_all(
+        """
+        SELECT page_no, block_type, COUNT(*) AS cnt
+        FROM page_content_blocks
+        WHERE document_id=?
+        GROUP BY page_no, block_type
+        ORDER BY page_no, block_type
+        """,
+        (document_id,),
+    )
+    return {"document": doc, "pages": pages, "formulas": formulas, "content_summary": content_summary}
 
 
 @app.get("/documents/{document_id}/pages")
@@ -153,7 +176,32 @@ def get_page(document_id: str, page_no: int):
         "SELECT * FROM formula_blocks WHERE document_id=? AND page_no=? ORDER BY formula_seq",
         (document_id, page_no),
     )
-    return {"page": page, "assets": assets, "formulas": formulas}
+    content_blocks = fetch_all(
+        """
+        SELECT id,block_seq,block_type,role,text_content,latex,formula_id,bbox_json,metadata_json,created_at
+        FROM page_content_blocks
+        WHERE document_id=? AND page_no=?
+        ORDER BY block_seq
+        """,
+        (document_id, page_no),
+    )
+    return {"page": page, "assets": assets, "formulas": formulas, "content_blocks": content_blocks}
+
+
+@app.get("/documents/{document_id}/content-blocks")
+def get_document_content_blocks(document_id: str):
+    doc = fetch_one("SELECT id FROM documents WHERE id=?", (document_id,))
+    if not doc:
+        raise HTTPException(status_code=404, detail="document not found")
+    return fetch_all(
+        """
+        SELECT page_no,block_seq,block_type,role,text_content,latex,formula_id,bbox_json,metadata_json,created_at
+        FROM page_content_blocks
+        WHERE document_id=?
+        ORDER BY page_no, block_seq
+        """,
+        (document_id,),
+    )
 
 
 @app.get("/formulas/search")
@@ -170,6 +218,22 @@ def search_formulas(q: str = ""):
         LIMIT 100
         """,
         (like, like, like, like),
+    )
+
+
+@app.get("/content/search")
+def search_content(q: str = ""):
+    like = f"%{q}%"
+    return fetch_all(
+        """
+        SELECT c.document_id,d.filename,c.page_no,c.block_seq,c.block_type,c.role,c.text_content,c.latex,c.formula_id
+        FROM page_content_blocks c
+        JOIN documents d ON d.id = c.document_id
+        WHERE c.text_content LIKE ? OR c.latex LIKE ? OR d.filename LIKE ?
+        ORDER BY d.created_at DESC, c.page_no, c.block_seq
+        LIMIT 100
+        """,
+        (like, like, like),
     )
 
 
@@ -206,19 +270,24 @@ def revalidate_formula(formula_id: int):
         try_evaluate_simple_numbers,
         validate_formula_candidate,
     )
+    from .formula_structure import formula_diagnostics, repair_formula_latex
 
     row = fetch_one("SELECT * FROM formula_blocks WHERE id=?", (formula_id,))
     if not row:
         raise HTTPException(status_code=404, detail="formula not found")
 
     source = row.get("raw_text") or row.get("latex") or ""
-    normalized = normalize_broken_formula_text(source)
+    normalized = normalize_broken_formula_text(repair_formula_latex(source))
     dsl = build_formula_dsl(normalized)
+    diagnostics = formula_diagnostics(normalized)
+    dsl["structure_diagnostics"] = diagnostics
     numeric_hint = try_evaluate_simple_numbers(normalized)
     if numeric_hint:
         dsl["numeric_hint"] = numeric_hint
     status, msg = validate_formula_candidate(normalized)
-    final_status = "CANDIDATE" if status == "PASS" else "NEEDS_REVIEW"
+    if diagnostics.get("warnings"):
+        msg = f"{msg}; structure_warnings={','.join(diagnostics['warnings'])}"
+    final_status = "CANDIDATE" if status == "PASS" and not diagnostics.get("warnings") else "NEEDS_REVIEW"
 
     with get_conn() as conn:
         conn.execute(
@@ -238,6 +307,10 @@ def revalidate_formula(formula_id: int):
                 utc_now(),
                 formula_id,
             ),
+        )
+        conn.execute(
+            "UPDATE page_content_blocks SET latex=?, metadata_json=? WHERE formula_id=?",
+            (normalized, to_json({"revalidated": True, "status": final_status}), formula_id),
         )
         conn.execute(
             "INSERT INTO formula_validation_results(formula_id,rule_name,result,message,created_at) VALUES(?,?,?,?,?)",
@@ -282,6 +355,7 @@ def regroup_document_formulas(document_id: str):
             "DELETE FROM formula_validation_results WHERE formula_id IN (SELECT id FROM formula_blocks WHERE document_id=?)",
             (document_id,),
         )
+        conn.execute("DELETE FROM page_content_blocks WHERE document_id=? AND block_type='formula'", (document_id,))
         conn.execute("DELETE FROM formula_blocks WHERE document_id=?", (document_id,))
 
         pages = conn.execute(

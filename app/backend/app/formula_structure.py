@@ -129,15 +129,10 @@ def _strip_wrappers(s: str) -> str:
 
 
 def _recognize_whole_life_insurance_formula(s: str) -> str | None:
-    """Detect and canonicalize the common whole-life insurance identity.
-
-    Target pattern:
-    A_{x:\overline{\infty}|}
-      = \sum_{k=0}^{\infty} v^{k+1} {}_{k}p_x q_{x+k}
-      = \sum_{k=0}^{\infty} \frac{v^{x+k+1}(l_{x+k}-l_{x+k+1})}{v^x l_x}
-    """
+    """Detect and canonicalize the common whole-life insurance identity."""
     compact = re.sub(r"\s+", "", s)
     compact = compact.replace("\\times", "").replace("\\cdot", "")
+    compact = compact.replace("∞", "\\infty")
     score = 0
     for token in ["A", "x", "\\infty", "\\sum", "k=0", "v", "p", "q", "l", "x+k", "x+k+1"]:
         if token in compact:
@@ -148,7 +143,6 @@ def _recognize_whole_life_insurance_formula(s: str) -> str | None:
 
 
 def _repair_actuarial_overline_notation(s: str) -> str:
-    # A x : infinity, A_{x:\infty}, A_{x:overline infinity|} -> A_{x:\overline{\infty}|}
     s = re.sub(
         r"\bA\s*_?\s*\{?\s*x\s*[:：]\s*(?:\\overline\s*)?\{?\s*\\?infty\s*\}?\s*\|?\s*\}?",
         r"A_{x:\overline{\infty}|}",
@@ -156,19 +150,16 @@ def _repair_actuarial_overline_notation(s: str) -> str:
         flags=re.IGNORECASE,
     )
     s = re.sub(r"\bA\s*x\s*[:：]\s*\\?infty\s*\|?", r"A_{x:\overline{\infty}|}", s, flags=re.IGNORECASE)
-    # OCR sometimes reads infinity as oo or 00 in this position.
     s = re.sub(r"\bA\s*_?\s*\{?\s*x\s*[:：]\s*(?:oo|00)\s*\|?\s*\}?", r"A_{x:\overline{\infty}|}", s, flags=re.IGNORECASE)
     return s
 
 
 def _repair_sum_bounds(s: str) -> str:
-    # \sum k=0 \infty expr -> \sum_{k=0}^{\infty} expr
     s = re.sub(
         r"\\sum\s+([A-Za-z]\s*=\s*[^\s]+)\s+(\\infty|infty|oo|00|[A-Za-z0-9+\-]+)",
         lambda m: f"\\sum_{{{m.group(1).replace(' ', '')}}}^{{{_normalize_bound(m.group(2))}}}",
         s,
     )
-    # \sum_{k=0} \infty -> \sum_{k=0}^{\infty}
     s = re.sub(r"\\sum_\{([^}]+)\}\s+(\\infty|infty|oo|00|[A-Za-z0-9+\-]+)", lambda m: f"\\sum_{{{m.group(1)}}}^{{{_normalize_bound(m.group(2))}}}", s)
     return s
 
@@ -197,16 +188,15 @@ def _repair_whole_life_terms(s: str) -> str:
     # q x+k -> q_{x+k}
     s = re.sub(r"\bq\s*_?\s*\{?\s*x\s*\+\s*k\s*\}?", r"q_{x+k}", s, flags=re.IGNORECASE)
 
-    # l x+k, l_{x + k}, l_{x+k+1}
-    s = re.sub(r"\bl\s*_?\s*\{?\s*x\s*\+\s*k\s*\}?", r"l_{x+k}", s, flags=re.IGNORECASE)
+    # Longer shifted terms must be repaired before shorter x+k terms.
     s = re.sub(r"\bl\s*_?\s*\{?\s*x\s*\+\s*k\s*\+\s*1\s*\}?", r"l_{x+k+1}", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bl\s*_?\s*\{?\s*x\s*\+\s*k\s*\}?", r"l_{x+k}", s, flags=re.IGNORECASE)
 
     # v x+k+1 or v^{x+k+1}
     s = re.sub(r"\bv\s*\^?\s*\{?\s*x\s*\+\s*k\s*\+\s*1\s*\}?", r"v^{x+k+1}", s, flags=re.IGNORECASE)
     s = re.sub(r"\bv\s*\^?\s*\{?\s*k\s*\+\s*1\s*\}?", r"v^{k+1}", s, flags=re.IGNORECASE)
     s = re.sub(r"\bv\s*\^?\s*\{?\s*x\s*\}?", r"v^x", s, flags=re.IGNORECASE)
 
-    # Common rendered fraction from mortality table identity.
     s = re.sub(
         r"v\^\{x\+k\+1\}\s*\(?\s*l_\{x\+k\}\s*-\s*l_\{x\+k\+1\}\s*\)?\s*/\s*v\^x\s*l_?\{?x\}?",
         r"\\frac{v^{x+k+1}(l_{x+k}-l_{x+k+1})}{v^x l_x}",
@@ -216,21 +206,17 @@ def _repair_whole_life_terms(s: str) -> str:
 
 
 def _repair_fraction_patterns(s: str) -> str:
-    # l_{x+1}/l_x -> \frac{l_{x+1}}{l_x}
     s = re.sub(r"(l_\{x[+\-]?\d*\})\s*/\s*(l_\{?x\}?)", r"\\frac{\1}{\2}", s)
-    # Whole-life numerator/denominator, when OCR returns slash fraction.
     s = re.sub(
         r"(v\^\{x\+k\+1\}\s*\(l_\{x\+k\}\s*-\s*l_\{x\+k\+1\}\))\s*/\s*(v\^x\s*l_x)",
         r"\\frac{\1}{\2}",
         s,
     )
-    # simple token/token actuarial fractions
     s = re.sub(r"\b([A-Za-z]_\{?[A-Za-z0-9+\-]+\}?|[A-Za-z]+)\s*/\s*([A-Za-z]_\{?[A-Za-z0-9+\-]+\}?|[A-Za-z]+)\b", r"\\frac{\1}{\2}", s)
     return s
 
 
 def _repair_exponents(s: str) -> str:
-    # e - delta, e - 2 delta -> e^{-\delta}, e^{-2\delta}
     s = re.sub(r"\be\s*-\s*(\d*)\s*\\delta\b", lambda m: f"e^{{-{m.group(1)}\\delta}}", s)
     s = re.sub(r"\be\s*\^\s*([-+]?[A-Za-z0-9\\]+)", r"e^{\1}", s)
     s = re.sub(r"\bv\s*\^\s*([A-Za-z0-9+\-]+)", r"v^{\1}", s)
@@ -240,7 +226,6 @@ def _repair_exponents(s: str) -> str:
 def _repair_subscripts(s: str) -> str:
     for sym in ACTUARIAL_SYMBOLS:
         s = re.sub(rf"\b{re.escape(sym)}\s*_\s*([A-Za-z0-9+\-]+)", rf"{sym}_{{\1}}", s)
-    # OCR often writes lx, qx, px, Dx, Nx without underscore.
     s = re.sub(r"\bl\s*x\b", r"l_x", s, flags=re.IGNORECASE)
     s = re.sub(r"\bq\s*x\b", r"q_x", s, flags=re.IGNORECASE)
     s = re.sub(r"\bp\s*x\b", r"p_x", s, flags=re.IGNORECASE)
@@ -256,7 +241,6 @@ def _repair_expectation_names(s: str) -> str:
 
 
 def _repair_actuarial_shifted_life_symbols(s: str) -> str:
-    # l x + 1 -> l_{x+1}
     s = re.sub(r"\bl\s*x\s*\+\s*(\d+)\b", r"l_{x+\1}", s, flags=re.IGNORECASE)
     s = re.sub(r"\bq\s*x\s*\+\s*(\d+)\b", r"q_{x+\1}", s, flags=re.IGNORECASE)
     s = re.sub(r"\bp\s*x\s*\+\s*(\d+)\b", r"p_{x+\1}", s, flags=re.IGNORECASE)

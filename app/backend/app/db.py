@@ -96,9 +96,31 @@ def init_db() -> None:
                 FOREIGN KEY(formula_id) REFERENCES formula_blocks(id) ON DELETE CASCADE
             );
 
+            -- Ordered mixed-content view of a page.
+            -- This table is for display/search/RAG/review. formula_blocks remains
+            -- the canonical place for validated formulas.
+            CREATE TABLE IF NOT EXISTS page_content_blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL,
+                page_no INTEGER NOT NULL,
+                block_seq INTEGER NOT NULL,
+                block_type TEXT NOT NULL,       -- text, formula, table, image, note
+                role TEXT,                      -- paragraph, equation, caption, heading
+                text_content TEXT,              -- human text or display text
+                latex TEXT,                     -- canonical LaTeX for formula block
+                formula_id INTEGER,
+                bbox_json TEXT,
+                metadata_json TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
+                FOREIGN KEY(formula_id) REFERENCES formula_blocks(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_pages_doc_page ON pages(document_id, page_no);
             CREATE INDEX IF NOT EXISTS idx_formula_doc_page ON formula_blocks(document_id, page_no);
             CREATE INDEX IF NOT EXISTS idx_formula_status ON formula_blocks(status);
+            CREATE INDEX IF NOT EXISTS idx_content_doc_page ON page_content_blocks(document_id, page_no, block_seq);
+            CREATE INDEX IF NOT EXISTS idx_content_type ON page_content_blocks(block_type);
             """
         )
 

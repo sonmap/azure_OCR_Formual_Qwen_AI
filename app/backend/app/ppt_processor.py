@@ -20,6 +20,7 @@ from .formula_parser import (
     validate_formula_candidate,
 )
 from .formula_structure import formula_diagnostics, repair_formula_latex
+from .mixed_content import build_mixed_content_blocks, extract_page_text_ocr
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -126,6 +127,8 @@ def _insert_formula(conn, doc_id: str, page_no: int, item: dict[str, Any], sourc
         ),
     )
     formula_id = int(cur.lastrowid)
+    item["formula_id"] = formula_id
+    item["status"] = final_status
     conn.execute(
         "INSERT INTO formula_validation_results(formula_id,rule_name,result,message,created_at) VALUES(?,?,?,?,?)",
         (formula_id, "basic_syntax", status, msg, utc_now()),
@@ -137,9 +140,8 @@ def _insert_formula(conn, doc_id: str, page_no: int, item: dict[str, Any], sourc
     return formula_id
 
 
-def _insert_structured_image_formulas(conn, doc_id: str, page_no: int, image_path: str, ocr_engine: str | None, start_seq: int, title: str) -> int:
+def _insert_structured_image_formulas(conn, doc_id: str, page_no: int, image_path: str, ocr_engine: str | None, start_seq: int, title: str) -> list[dict[str, Any]]:
     """Run formula-region OCR and insert all structured candidates."""
-    inserted = 0
     try:
         candidates = recognize_formula_regions(image_path, ocr_engine)
     except Exception:
@@ -160,11 +162,13 @@ def _insert_structured_image_formulas(conn, doc_id: str, page_no: int, image_pat
                 }
             ]
 
+    inserted: list[dict[str, Any]] = []
     for offset, cand in enumerate(candidates):
         cand["formula_seq"] = start_seq + offset
         cand.setdefault("formula_title", title)
-        _insert_formula(conn, doc_id, page_no, cand)
-        inserted += 1
+        formula_id = _insert_formula(conn, doc_id, page_no, cand)
+        cand["formula_id"] = formula_id
+        inserted.append(cand)
     return inserted
 
 
@@ -173,7 +177,7 @@ def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) ->
     with get_conn() as conn:
         for idx, slide in enumerate(prs.slides, start=1):
             texts: list[str] = []
-            tables: list[list[list[str]]] = []
+            formulas_for_page: list[dict[str, Any]] = []
             title = None
             formula_seq = 1
             slide_asset_dir = ASSET_DIR / doc_id / f"page_{idx}"
@@ -189,7 +193,6 @@ def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) ->
                     table_rows = []
                     for row in shape.table.rows:
                         table_rows.append([cell.text for cell in row.cells])
-                    tables.append(table_rows)
                     _insert_asset(conn, doc_id, idx, "table", None, json.dumps(table_rows, ensure_ascii=False), {"shape_no": shape_no})
 
                 if getattr(shape, "shape_type", None) and hasattr(shape, "image"):
@@ -207,8 +210,9 @@ def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) ->
                             formula_seq,
                             "PPT 이미지 수식 구조 OCR 후보",
                         )
-                        _insert_asset(conn, doc_id, idx, "image", str(img_path), f"structured_formula_candidates={inserted}", {"shape_no": shape_no, "engine": ocr_engine})
-                        formula_seq += inserted
+                        formulas_for_page.extend(inserted)
+                        _insert_asset(conn, doc_id, idx, "image", str(img_path), f"structured_formula_candidates={len(inserted)}", {"shape_no": shape_no, "engine": ocr_engine})
+                        formula_seq += len(inserted)
                     except Exception as exc:
                         _insert_asset(conn, doc_id, idx, "image_error", None, str(exc), {"shape_no": shape_no})
 
@@ -217,7 +221,9 @@ def _process_pptx(doc_id: str, file_path: str, ocr_engine: str | None = None) ->
             for c in extract_formula_candidates(all_text):
                 c["formula_seq"] = formula_seq
                 _insert_formula(conn, doc_id, idx, c)
+                formulas_for_page.append(c)
                 formula_seq += 1
+            build_mixed_content_blocks(conn, doc_id, idx, all_text, formulas_for_page, source="pptx_text_and_images")
     return len(prs.slides)
 
 
@@ -228,8 +234,9 @@ def _process_image(doc_id: str, file_path: str, ocr_engine: str | None = None) -
     asset_path = asset_dir / Path(file_path).name
     shutil.copyfile(file_path, asset_path)
     with get_conn() as conn:
-        _insert_page(conn, doc_id, page_no, "이미지 수식 페이지", "", str(asset_path))
-        inserted = _insert_structured_image_formulas(
+        page_text = extract_page_text_ocr(str(asset_path))
+        _insert_page(conn, doc_id, page_no, "이미지 혼합 OCR 페이지", page_text, str(asset_path))
+        formulas = _insert_structured_image_formulas(
             conn,
             doc_id,
             page_no,
@@ -238,7 +245,8 @@ def _process_image(doc_id: str, file_path: str, ocr_engine: str | None = None) -
             1,
             "이미지 수식 구조 OCR 후보",
         )
-        _insert_asset(conn, doc_id, page_no, "image", str(asset_path), f"structured_formula_candidates={inserted}", {"engine": ocr_engine})
+        _insert_asset(conn, doc_id, page_no, "image", str(asset_path), f"text_chars={len(page_text)}; structured_formula_candidates={len(formulas)}", {"engine": ocr_engine})
+        build_mixed_content_blocks(conn, doc_id, page_no, page_text, formulas, source="image_text_ocr_and_formula_regions")
     return 1
 
 
@@ -252,17 +260,26 @@ def _process_pdf(doc_id: str, file_path: str, ocr_engine: str | None = None) -> 
             page_dir.mkdir(parents=True, exist_ok=True)
             img_path = page_dir / "page.png"
             pix.save(str(img_path))
+
+            # If embedded PDF text is empty or too short, use ordinary OCR for paragraph text.
+            text_source = "pdf_embedded_text"
+            if len(text.strip()) < 30:
+                ocr_text = extract_page_text_ocr(str(img_path))
+                if len(ocr_text) > len(text):
+                    text = ocr_text
+                    text_source = "pdf_page_text_ocr"
+
             _insert_page(conn, doc_id, page_idx, f"PDF Page {page_idx}", text, str(img_path))
             formula_seq = 1
+            formulas_for_page: list[dict[str, Any]] = []
             for c in extract_formula_candidates(text):
                 c["formula_seq"] = formula_seq
                 _insert_formula(conn, doc_id, page_idx, c)
+                formulas_for_page.append(c)
                 formula_seq += 1
 
             # Always run structured region OCR for rendered PDF pages.
-            # Text extraction alone cannot recover 2D formulas such as fractions,
-            # summation bounds, integral bounds, and multi-line actuarial formulas.
-            inserted = _insert_structured_image_formulas(
+            formulas = _insert_structured_image_formulas(
                 conn,
                 doc_id,
                 page_idx,
@@ -271,5 +288,7 @@ def _process_pdf(doc_id: str, file_path: str, ocr_engine: str | None = None) -> 
                 formula_seq,
                 "PDF 페이지 수식 영역 구조 OCR 후보",
             )
-            _insert_asset(conn, doc_id, page_idx, "page_image", str(img_path), f"structured_formula_candidates={inserted}", {"engine": ocr_engine})
+            formulas_for_page.extend(formulas)
+            _insert_asset(conn, doc_id, page_idx, "page_image", str(img_path), f"structured_formula_candidates={len(formulas)}", {"engine": ocr_engine, "text_source": text_source})
+            build_mixed_content_blocks(conn, doc_id, page_idx, text, formulas_for_page, source=text_source)
     return len(pdf)
